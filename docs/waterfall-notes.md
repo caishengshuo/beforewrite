@@ -88,3 +88,81 @@ Invalid object passed in, ':' or '}' expected. (185)
 然后把文件写成一整个 `null`。
 
 **改 JSON 一律用支持 UTF-8 无 BOM 的工具**（编辑器 / Node 脚本），不要用 PowerShell 序列化往返。
+
+## 坑三：界面半边（v5 实测）
+
+### 1. 客户端模块 id 必须逐字等于包名
+
+`client.js` 里的
+
+```js
+window.__ModuleLoader__.load({ id: '<包名>', factory(require) { ... } })
+```
+
+那个 `id` 不是随便写的标识，装载器拿它核对「这个包有没有真正注册过」。用 `dsh-beforewrite` 写在 a 包、装到 b 名下，boot 就报：
+
+```
+web boot: 1 entry did not activate <包名>: import failed:
+client-modules: could not load "<包名>": ... loaded without registering "<包名>" via __ModuleLoader__.load
+```
+
+**而且 client 半边失败会拖死整个 bundle 条目**——宿主那半边（快照、工具、HTTP 接口）一起不上线。所以「界面坏了」等于「功能全没了」，改 UI 前先把这条记住。
+
+部署时的做法：源码里保持公开包名，落地时用 Replace 换成部署包名再写盘。
+
+### 2. `apply` 执行时拿不到 `webServer`
+
+插件 activate 早于 web 服务 provide：
+
+```
+apply final 完成，已挂 write-intent / edit-intent / snapshot 动作
+webServer 服务不可用，图形界面取数将失败
+```
+
+`ctx.get('webServer')` 是 `undefined`，路由挂不上，前端一律 404。修法是轮询等它：
+
+```js
+function mountApi() {
+  const server = ctx.get('webServer')
+  if (!server) return false
+  keep(server.register({ kind: 'prefix', path: '/beforewrite/api', handler: apiHandler }))
+  return true
+}
+let tries = 0
+const timer = setInterval(() => {
+  if (mountApi() || ++tries > 240) clearInterval(timer)
+}, 500)
+if (typeof timer.unref === 'function') timer.unref()
+```
+
+实测 3.3 秒后拿到并挂载成功。
+
+### 3. `require('styles')` 拿不到 → 必须自己插 `<style>`
+
+只靠样式服务的话，整块面板会变成**无样式的裸文字铺在对话上面**：半透明、和正文叠在一起，字都看不清（还会因为 `pointer-events` 没生效而点不动按钮）。可靠的写法是自己往 head 里插一份，服务能拿到就顺手也调一次：
+
+```js
+ctx.effect(function () {
+  const el = document.createElement('style')
+  el.setAttribute('data-beforewrite', '1')
+  el.textContent = CSS
+  document.head.appendChild(el)
+  return function () { if (el.parentNode) el.parentNode.removeChild(el) }
+}, 'beforewrite-styles-dom')
+```
+
+### 4. 浏览器里没有控制台，就把日志写回宿主
+
+界面出问题时只看得见「不显示」，看不见原因。给插件自己的 HTTP 接口加一条 `/client-log?m=...`，客户端在关键节点 `fetch` 过来，宿主 append 到 `debug.log`：
+
+```
+CLIENT apply done, styleTags=1, cssLen=3301
+CLIENT launch clicked
+CLIENT open mask=0/0/1699/982 top=bw-text
+```
+
+最后一行是自检：面板的 `getBoundingClientRect()` 尺寸 + `document.elementFromPoint(屏幕中心)` 命中的是谁。`top=` 如果还是对话正文的 class，说明面板被压在下面（层叠上下文），不是没渲染。
+
+### 5. 悬浮按钮别抢别人的位置
+
+`shell.overlay` 是整层覆盖、子元素各自 `pointer-events:auto`。按钮放右下角会和别的插件（比如 dsh-purge）的 dock 按钮打架，实测直接盖住对方的按钮。放**右上角顶栏下方**（`right:18px; top:66px`）最安全。
