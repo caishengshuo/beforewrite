@@ -1,0 +1,40 @@
+{
+  "name": "dsh-beforewrite",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "Every file, one version before it breaks. A DSH host plugin that snapshots a file the instant before an agent rewrites it, and puts it back in one command.",
+  "license": "MIT",
+  "author": "caishengshuo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caishengshuo/beforewrite.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "coding-agent",
+    "undo",
+    "snapshot",
+    "content-addressed",
+    "waterfall",
+    "file-recovery"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
