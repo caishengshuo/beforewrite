@@ -38,6 +38,11 @@ function storeRoot() {
 const ROOT = storeRoot()
 const BLOB_DIR = path.join(ROOT, 'blobs')
 const INDEX_FILE = path.join(ROOT, 'index.jsonl')
+/** 会话事件流（说过的哪句话 / 做过哪些事），供时间轴界面读取。 */
+const SESS_FILE = path.join(ROOT, 'sessions.jsonl')
+const EVENT_LIMIT = 20000
+/** 单条台词最多存多少字。 */
+const SAYS_CAP = 400
 
 function ensureDirs() {
   nfs.mkdirSync(BLOB_DIR, { recursive: true })
@@ -93,6 +98,169 @@ function readIndex() {
   return out
 }
 
+function appendSession(entry) {
+  try {
+    ensureDirs()
+    nfs.appendFileSync(SESS_FILE, JSON.stringify(entry) + '\n', 'utf8')
+  } catch {
+    /* 事件流水写不进去也不能影响会话本身 */
+  }
+}
+
+function readSessionLog() {
+  const out = []
+  let raw = ''
+  try {
+    raw = nfs.readFileSync(SESS_FILE, 'utf8')
+  } catch {
+    return out
+  }
+  const lines = raw.split('\n')
+  const start = Math.max(0, lines.length - EVENT_LIMIT)
+  for (let i = start; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (!line) continue
+    try {
+      out.push(JSON.parse(line))
+    } catch {
+      /* 坏行跳过 */
+    }
+  }
+  return out
+}
+
+/** 注入型消息的头，这些不是「用户说的话」，时间轴里不该出现。 */
+const NOISE_HEAD = /^(<hindsight_knowledge|<hindsight_knowledge_refresh|<engram_memory_context|<system-reminder|<untrusted-memory|Current runtime context|<available_skills>|<current_user_request>)/i
+
+function cleanSays(text) {
+  let out = String(text || '')
+  out = out.replace(/<untrusted-memory>[\s\S]*?<\/untrusted-memory>/gi, ' ')
+  out = out.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, ' ')
+  out = out.replace(/<hindsight_knowledge[^>]*>[\s\S]*?<\/hindsight_knowledge>/gi, ' ')
+  out = out.replace(/<hindsight_knowledge_refresh[^>]*>[\s\S]*?<\/hindsight_knowledge_refresh>/gi, ' ')
+  out = out.replace(/<engram_memory_context[^>]*>[\s\S]*?<\/engram_memory_context>/gi, ' ')
+  out = out.replace(/<current_user_request>[\s\S]*?<\/current_user_request>/gi, ' ')
+  return out.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function isNoiseSays(entry) {
+  if (!entry || entry.kind !== 'says') return false
+  const text = String(entry.text || '').trim()
+  return !text || NOISE_HEAD.test(text)
+}
+
+function textOf(message) {
+  try {
+    if (!message) return ''
+    const content = message.content
+    let raw = ''
+    if (typeof content === 'string') raw = content
+    else if (Array.isArray(content)) {
+      const parts = []
+      for (const block of content) {
+        if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+      }
+      raw = parts.join('\n')
+    }
+    const trimmed = raw.trim()
+    // 纯注入（记忆块、运行时上下文、技能清单）：整条丢掉，别让它污染「说过的哪句话」。
+    if (!trimmed || NOISE_HEAD.test(trimmed)) return ''
+    const cleaned = cleanSays(trimmed)
+    return cleaned.slice(0, SAYS_CAP)
+  } catch {
+    /* 消息形状不合预期就算了 */
+  }
+  return ''
+}
+
+/** 从写盘钩子的 actor 里取出会话 id 与回合号（探针实测字段）。 */
+function actorInfo(actor) {
+  const out = { sid: '', turn: 0, step: 0, tool: '' }
+  try {
+    if (!actor) return out
+    out.tool = String(actor.name || '')
+    const agent = actor.agent
+    if (agent) {
+      out.sid = String(agent.id || '')
+      if (!out.sid && agent.session && agent.session.id) out.sid = String(agent.session.id)
+      const phase = agent.phase
+      if (phase) {
+        out.turn = Number(phase.turn) || 0
+        out.step = Number(phase.step) || 0
+      }
+    }
+  } catch {
+    /* 拿不到就留空 */
+  }
+  return out
+}
+
+/** 某会话的完整时间轴：用户台词 + 工具动作 + 文件快照，按时间合并。 */
+function timelineFor(sid) {
+  const rows = []
+  for (const e of readSessionLog()) {
+    if (sid && e.sid !== sid) continue
+    // 历史遗留：v4 之前把注入型消息也记成了台词，读出来时一并滤掉，别让旧记录污染界面。
+    if (isNoiseSays(e)) continue
+    rows.push({
+      at: Number(e.at) || 0,
+      kind: String(e.kind || 'event'),
+      text: String(e.text || ''),
+      turn: Number(e.turn) || 0,
+      step: Number(e.step) || 0,
+      sid: String(e.sid || ''),
+    })
+  }
+  for (const s of readIndex()) {
+    if (sid && s.sid !== sid) continue
+    rows.push({
+      at: Number(s.at) || 0,
+      kind: 'snap',
+      id: s.id,
+      action: String(s.action || ''),
+      text: String(s.path || ''),
+      size: s.size,
+      sha: !!s.sha,
+      absent: !!s.absent,
+      tooLarge: !!s.tooLarge,
+      turn: Number(s.turn) || 0,
+      sid: String(s.sid || ''),
+    })
+  }
+  rows.sort((a, b) => a.at - b.at)
+  return rows
+}
+
+function sessionsSummary() {
+  const map = new Map()
+  const touch = (sid) => {
+    let row = map.get(sid)
+    if (!row) {
+      row = { sid, first: '', last: 0, events: 0, says: 0, snaps: 0 }
+      map.set(sid, row)
+    }
+    return row
+  }
+  for (const e of readSessionLog()) {
+    const sid = String(e.sid || '')
+    if (!sid) continue
+    if (isNoiseSays(e)) continue
+    const row = touch(sid)
+    row.events += 1
+    if (Number(e.at) > row.last) row.last = Number(e.at) || 0
+    if (!row.first && e.kind === 'says' && e.text) row.first = String(e.text).slice(0, 80)
+    if (e.kind === 'says') row.says += 1
+  }
+  for (const s of readIndex()) {
+    const sid = String(s.sid || '')
+    if (!sid) continue
+    const row = touch(sid)
+    row.snaps += 1
+    if (Number(s.at) > row.last) row.last = Number(s.at) || 0
+  }
+  return Array.from(map.values()).sort((a, b) => b.last - a.last)
+}
+
 function fmtTime(ts) {
   const d = new Date(typeof ts === 'number' ? ts : Date.now())
   const p = (n) => String(n).padStart(2, '0')
@@ -120,20 +288,30 @@ function blobPath(sha) {
 /**
  * 拍一张「写之前」的快照。任何异常都被吞掉并记进索引，绝不打断写盘。
  */
-async function snapshot(fsService, target, action) {
-  debug('snapshot 进入 action=' + action + ' display=' + String(target && target.displayPath) + ' fs=' + (fsService ? 'ok' : 'undefined'))
+async function snapshot(fsService, target, action, meta) {
+  const info0 = meta && typeof meta === 'object' ? meta : {}
+  debug('snapshot 进入 action=' + action + ' display=' + String(target && target.displayPath) + ' fs=' + (fsService ? 'ok' : 'undefined') + ' sid=' + String(info0.sid || '-'))
   if (!fsService || !target) return
   const display = String(target.displayPath || '')
   const key = String(target.targetKey || '')
   if (!display || IGNORE.test(display)) return
+  const base = {
+    action,
+    path: display,
+    key,
+    sid: String(info0.sid || ''),
+    turn: Number(info0.turn) || 0,
+    step: Number(info0.step) || 0,
+    tool: String(info0.tool || ''),
+  }
   try {
     const info = await fsService.stat(target)
     if (!info || info.type !== 'file') {
-      appendIndex({ at: Date.now(), action, path: display, key, absent: true })
+      appendIndex({ at: Date.now(), ...base, absent: true })
       return
     }
     if (typeof info.size === 'number' && info.size > MAX_BYTES) {
-      appendIndex({ at: Date.now(), action, path: display, key, tooLarge: true, size: info.size })
+      appendIndex({ at: Date.now(), ...base, tooLarge: true, size: info.size })
       return
     }
     const bytes = await fsService.readBytes(target, undefined, MAX_BYTES)
@@ -141,9 +319,9 @@ async function snapshot(fsService, target, action) {
     ensureDirs()
     const file = blobPath(sha)
     if (!nfs.existsSync(file)) nfs.writeFileSync(file, bytes)
-    appendIndex({ at: Date.now(), action, path: display, key, sha, size: bytes.byteLength })
+    appendIndex({ at: Date.now(), ...base, sha, size: bytes.byteLength })
   } catch (error) {
-    appendIndex({ at: Date.now(), action, path: display, key, error: message(error) })
+    appendIndex({ at: Date.now(), ...base, error: message(error) })
   }
 }
 
@@ -528,7 +706,7 @@ export function apply(ctx) {
   const writeListener = async (target, actor, next) => {
     debug('write-intent 触发 display=' + String(target && target.displayPath))
     try {
-      await snapshot(readFs(), target, 'write')
+      await snapshot(readFs(), target, 'write', actorInfo(actor))
     } catch {
       /* 绝不打断写盘 */
     }
@@ -538,7 +716,7 @@ export function apply(ctx) {
   const editListener = async (target, actor, next) => {
     debug('edit-intent 触发 display=' + String(target && target.displayPath))
     try {
-      await snapshot(readFs(), target, 'edit')
+      await snapshot(readFs(), target, 'edit', actorInfo(actor))
     } catch {
       /* 同上 */
     }
@@ -553,6 +731,140 @@ export function apply(ctx) {
     keep(ctx.tools.register(buildTool(readFs)))
   } catch (error) {
     console.error('[fs-time-machine] 注册 time_machine 工具失败：' + message(error))
+  }
+
+  // ── 会话事件流：只观察，不改任何决策（emit 监听器，抛错也只记日志）────────────
+  // 这是 agent/pre-step 那次崩溃的教训：waterfall 必须 return next()，
+  // 所以「说过的哪句话 / 做过哪些事」一律从 emit 的 session/event 取，不碰 pre-step。
+  const sessionListener = (session, event) => {
+    try {
+      if (!event || typeof event.type !== 'string') return
+      const sid = String((session && session.id) || '')
+      const at = Number(event.time) || Date.now()
+      const seq = Number(event.seq) || 0
+      const data = event.data && typeof event.data === 'object' ? event.data : {}
+      if (event.type === 'user/message') {
+        const said = textOf(data)
+        if (said) appendSession({ at, sid, seq, kind: 'says', text: said })
+        return
+      }
+      if (event.type === 'turn/start') {
+        appendSession({ at, sid, seq, kind: 'turn', turn: Number(data.turn) || 0, text: '回合 ' + String(data.turn || '?') + ' 开始' })
+        return
+      }
+      if (event.type === 'tool/call') {
+        appendSession({
+          at, sid, seq, kind: 'action',
+          turn: Number(data.turn) || 0,
+          step: Number(data.step) || 0,
+          text: String(data.name || '') + ' ' + String(data.arguments || '').replace(/\s+/g, ' ').slice(0, 200),
+        })
+        return
+      }
+      if (event.type === 'tool/result') {
+        const err = data.error ? '失败 ' + String(data.error.code || data.error.name || '') : '完成'
+        appendSession({
+          at, sid, seq, kind: 'result',
+          turn: Number(data.turn) || 0,
+          step: Number(data.step) || 0,
+          text: err,
+        })
+      }
+    } catch {
+      /* 事件流是旁路，出错绝不影响会话 */
+    }
+  }
+
+  const SESSION_OPTIONS = { global: true, prepend: true }
+  keep(ctx.on('session/event', sessionListener, SESSION_OPTIONS))
+
+  // ── HTTP 接口：给图形化时间轴取数（同源，走宿主自带的 web 服务）────────────
+  const send = (res, code, body) => {
+    try {
+      const text = JSON.stringify(body)
+      res.writeHead(code, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      res.end(text)
+    } catch {
+      /* 响应已经结束就算了 */
+    }
+  }
+
+  const apiHandler = async (req, res) => {
+    try {
+      const url = new URL(String(req.url || '/'), 'http://127.0.0.1')
+      const sub = url.pathname.replace(/^\/beforewrite\/api/, '') || '/'
+      if (sub === '/' || sub === '/ping') {
+        return send(res, 200, { ok: true, root: ROOT, version: 'v4' })
+      }
+      if (sub === '/client-log') {
+        // 浏览器里没法看控制台，就让客户端把话写回宿主日志：这是唯一的远端眼睛。
+        const m = url.searchParams.get('m') || ''
+        debug('CLIENT ' + m.slice(0, 400))
+        return send(res, 200, { ok: true })
+      }
+      if (sub === '/sessions') {
+        return send(res, 200, { ok: true, sessions: sessionsSummary() })
+      }
+      if (sub === '/timeline') {
+        const sid = url.searchParams.get('sid') || ''
+        return send(res, 200, { ok: true, sid, rows: timelineFor(sid) })
+      }
+      if (sub === '/diff') {
+        const id = Number(url.searchParams.get('id'))
+        const fsService = readFs()
+        const text = fsService
+          ? await runDiff(fsService, readIndex(), { id })
+          : '文件系统服务当前不可用。'
+        return send(res, 200, { ok: true, text })
+      }
+      if (sub === '/restore') {
+        const id = Number(url.searchParams.get('id'))
+        const fsService = readFs()
+        if (!fsService) return send(res, 200, { ok: false, text: '文件系统服务当前不可用。' })
+        const text = await runRestore(fsService, readIndex(), { id })
+        return send(res, 200, { ok: true, text })
+      }
+      return send(res, 404, { ok: false, text: '没有这个接口：' + sub })
+    } catch (error) {
+      return send(res, 200, { ok: false, text: '接口内部错误：' + message(error) })
+    }
+  }
+
+  // webServer 服务在本插件 activate 的那一刻可能还没 provide（实测：apply 时 ctx.get('webServer')
+  // 返回 undefined，日志里留下「webServer 服务不可用」）。所以先试一次，拿不到就轮询等它出现，
+  // 拿到之后立刻挂载。这是唯一一条能让界面取到数的路。
+  let mounted = false
+  const mountApi = () => {
+    if (mounted) return true
+    try {
+      const webServer = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined
+      if (!webServer || typeof webServer.register !== 'function') return false
+      keep(webServer.register({ kind: 'prefix', path: '/beforewrite/api', handler: apiHandler }))
+      mounted = true
+      debug('已注册 HTTP 接口 /beforewrite/api')
+      return true
+    } catch (error) {
+      debug('注册 HTTP 接口失败：' + message(error))
+      return false
+    }
+  }
+
+  if (!mountApi()) {
+    debug('webServer 尚未就绪，开始轮询等待')
+    let tries = 0
+    const timer = setInterval(() => {
+      tries += 1
+      if (mountApi()) return
+      if (tries >= 240) {
+        clearInterval(timer)
+        debug('轮询 240 次（约 2 分钟）仍未拿到 webServer，放弃挂载')
+      }
+    }, 500)
+    if (timer && typeof timer.unref === 'function') timer.unref()
+    keep(() => clearInterval(timer))
   }
 
   console.log('[fs-time-machine] 已启动，仓库目录：' + ROOT)
