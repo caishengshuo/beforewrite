@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "File Time Machine",
+    "description": "Snapshots every file before it is written or edited, with diff and one-step rollback."
+  }
+}
