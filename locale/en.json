@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "File Time Machine",
-    "description": "Snapshots every file before it is written or edited, with diff and one-step rollback."
+    "title": "BeforeWrite · File Time Machine",
+    "description": "Snapshots a file the instant before an agent rewrites it, with a per-session timeline where any snapshot restores in one click."
   }
 }
