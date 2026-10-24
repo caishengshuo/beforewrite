@@ -117,6 +117,28 @@ time_machine(action="snapshot", path="G:\\proj\\config.yaml", reason="before-bas
 
 所以回滚本身是安全的：反悔就再 `restore` 一次那个新编号。快照链不会断，历史永远只增不减。
 
+## 图形界面：一条时间轴，点一下就回到那一刻
+
+装好之后，界面右上角（顶栏下方）会多一个 **⏱ 时光机** 按钮。点开是这样：
+
+- **左栏**：这个 DSH 里跑过的每个会话，带「最后活动时间 / 事件数 / 台词数 / 快照数」，点一个就切一条时间轴。
+- **右栏**：该会话的完整时间轴，按时间合并三类记录——
+  - `说过` 你在这一轮真正打出去的话（注入的记忆块、运行时上下文会被过滤掉，不算台词）
+  - `动作` DSH 调了哪个工具、参数前 200 字
+  - `快照` 这一轮它改了哪个文件、多少字节
+- 每条快照右侧一个 **回档** 按钮，点了就把那个文件还原到那一刻；`diff` 可以先看差在哪。
+
+时间轴的数据不是另存一份对话，而是旁路监听宿主的 `session/event`（emit，只读，不改任何决策），落盘在你自己的 `sessions.jsonl` 里。界面取数走插件自带的 HTTP 接口：
+
+| 接口 | 作用 |
+|---|---|
+| `GET /beforewrite/api/sessions` | 会话列表 |
+| `GET /beforewrite/api/timeline?sid=…` | 某会话的时间轴 |
+| `GET /beforewrite/api/diff?id=…` | 某条快照的 diff |
+| `GET /beforewrite/api/restore?id=…` | 把文件还原到该快照 |
+
+> 界面那半边是 `client.js`，纯 JS、无构建步骤，挂在 `shell.overlay` 槽位上。它自己往 `document.head` 插一份 `<style>`——因为宿主里 `require('styles')` 拿不到，只靠它整块面板会变成无样式的裸文字盖在对话上。
+
 ## 数据存在哪
 
 ```
@@ -143,8 +165,9 @@ time_machine(action="snapshot", path="G:\\proj\\config.yaml", reason="before-bas
 
 ```
 beforewrite/
-├── index.js              插件本体（apply + 六个动作 + 工具注册）
-├── package.json          dsh.bundle.patch 指向 patch 文件
+├── index.js              宿主半边：apply + 七个动作 + 工具注册 + HTTP 接口
+├── client.js             界面半边：⏱ 时光机按钮 + 时间轴面板（shell.overlay）
+├── package.json          dsh.bundle.patch 指向 patch 文件，dsh.client 声明界面半边
 ├── cordis.patch.yml      insert 一行，把插件挂进 Host
 ├── locale/{zh,en}.json   插件管理器里显示的名字与描述
 ├── icon.svg              图标
