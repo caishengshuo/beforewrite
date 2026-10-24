@@ -1,0 +1,4 @@
+- insert:
+    - id: beforewrite
+      name: dsh-beforewrite
+      config: {}
