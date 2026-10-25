@@ -13,6 +13,7 @@
 
 import { createHash } from 'node:crypto'
 import nfs from 'node:fs'
+import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -25,6 +26,8 @@ const MAX_BYTES = 2 * 1024 * 1024
 const INDEX_LIMIT = 20000
 /** 行数超过这个值就不做逐行 diff，只给粗粒度差异。 */
 const DIFF_CAP = 800
+/** 时间轴接口默认一次给多少条（多了浏览器渲染不动）。 */
+const TIMELINE_LIMIT = 400
 /** 自家仓库目录不自我快照。 */
 const IGNORE = /[\\/](node_modules|\.git|time-machine)[\\/]/i
 
@@ -53,6 +56,26 @@ function message(error) {
   return String(error)
 }
 
+/**
+ * 二进制启发式。
+ *
+ * 回档是「把字节当文本写回去」（fsService.writeText），所以对一个 PNG 回档会把整张图
+ * 写成 U+FFFD。存的时候先认出来，存一份 binary 标记，回档/比对时直接拒绝而不是毁文件。
+ */
+function looksBinary(bytes) {
+  if (!bytes || bytes.byteLength === 0) return false
+  const n = Math.min(bytes.byteLength, 8192)
+  for (let i = 0; i < n; i += 1) {
+    if (bytes[i] === 0) return true
+  }
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    return false
+  } catch {
+    return true
+  }
+}
+
 function appendIndex(entry) {
   try {
     ensureDirs()
@@ -68,7 +91,10 @@ function debug(line) {
     const file = path.join(ROOT, 'debug.log')
     let size = 0
     try { size = nfs.statSync(file).size } catch { size = 0 }
-    if (size > 262144) return
+    // 到 256KB 就滚一份，而不是静默停写 —— 之前那种「写不进去也不说」让排查少了一半线索。
+    if (size > 262144) {
+      try { nfs.renameSync(file, file + '.1') } catch { /* 转不动就继续追加 */ }
+    }
     nfs.appendFileSync(file, new Date().toISOString() + ' ' + line + '\n', 'utf8')
   } catch {
     /* 调试也不能影响业务 */
@@ -223,6 +249,7 @@ function timelineFor(sid) {
       sha: !!s.sha,
       absent: !!s.absent,
       tooLarge: !!s.tooLarge,
+      binary: !!s.binary,
       turn: Number(s.turn) || 0,
       sid: String(s.sid || ''),
     })
@@ -318,8 +345,14 @@ async function snapshot(fsService, target, action, meta) {
     const sha = createHash('sha256').update(bytes).digest('hex')
     ensureDirs()
     const file = blobPath(sha)
-    if (!nfs.existsSync(file)) nfs.writeFileSync(file, bytes)
-    appendIndex({ at: Date.now(), ...base, sha, size: bytes.byteLength })
+    // 大文件用异步写，别在事件循环里同步落 2MB。
+    try {
+      await fsp.access(file)
+    } catch {
+      await fsp.writeFile(file, bytes)
+    }
+    const binary = looksBinary(bytes)
+    appendIndex({ at: Date.now(), ...base, sha, size: bytes.byteLength, ...(binary ? { binary: true } : {}) })
   } catch (error) {
     appendIndex({ at: Date.now(), ...base, error: message(error) })
   }
@@ -491,6 +524,10 @@ async function runDiff(fsService, entries, args) {
   }
   const bytes = readBlob(entry.sha)
   if (!bytes) return '#' + entry.id + ' 的内容块丢失了（' + entry.sha + '），无法比较。'
+  // 老条目没有 binary 标记，就按内容现场判一次。
+  if (entry.binary || looksBinary(bytes)) {
+    return '#' + entry.id + ' 是二进制文件（' + fmtSize(bytes.byteLength) + '），不做逐行比对。'
+  }
 
   const oldText = bytes.toString('utf8')
   let newText = ''
@@ -518,6 +555,12 @@ async function runRestore(fsService, entries, args) {
   if (entry.tooLarge) return '#' + entry.id + ' 没有存内容（超过 ' + fmtSize(MAX_BYTES) + '），无法回滚。'
   const bytes = readBlob(entry.sha)
   if (!bytes) return '#' + entry.id + ' 的内容块丢失了（' + entry.sha + '），无法回滚。'
+  if (entry.binary || looksBinary(bytes)) {
+    return (
+      '#' + entry.id + ' 是二进制文件（' + fmtSize(bytes.byteLength) + '），回档会把字节当文本写回、把文件毁掉，所以这里拒绝。\n' +
+      '需要它的话：手动把内容块复制出来 —— ' + blobPath(entry.sha)
+    )
+  }
 
   let target
   try {
@@ -529,8 +572,18 @@ async function runRestore(fsService, entries, args) {
   // 回滚本身也要可撤销：先把当前内容存一份。
   await snapshot(fsService, target, 'restore')
 
+  // 带上版本号写入。期间如果文件被别的程序改过（不经过 fs 服务的改动不会被这次 snapshot 看见），
+  // 版本对不上就报错，而不是无声覆盖掉别人的改动。
+  let expected
   try {
-    const outcome = await fsService.writeText(target, bytes.toString('utf8'))
+    const info = await fsService.stat(target)
+    if (info && info.type === 'file' && info.version !== undefined) expected = { version: info.version }
+  } catch {
+    expected = undefined
+  }
+
+  try {
+    const outcome = await fsService.writeText(target, bytes.toString('utf8'), expected)
     return (
       '已回滚 ' + entry.path + '\n' +
       '恢复到 #' + entry.id + '（' + fmtTime(entry.at) + '）的状态，' +
@@ -538,7 +591,11 @@ async function runRestore(fsService, entries, args) {
       '回滚前的版本也存了一份，需要反悔就再 restore 那个新编号。'
     )
   } catch (error) {
-    return '回滚写入失败：' + message(error)
+    const why = message(error)
+    if (/version|conflict|stale/i.test(why)) {
+      return '回档写入失败：文件在回档过程中被别处改过（' + why + '）。再点一次回档就好。'
+    }
+    return '回滚写入失败：' + why
   }
 }
 
@@ -559,6 +616,12 @@ async function runSnapshot(fsService, args) {
   await snapshot(fsService, target, reason)
   const latest = readIndex().slice(-1)[0]
   if (!latest) return '打点没成功，检查一下路径 ' + raw + ' 是否存在。'
+  if (latest.absent) {
+    return (
+      '这个路径现在不存在（或不是普通文件）：' + target.displayPath + '\n' +
+      '已记下这件事（#' + latest.id + '，标记 ' + reason + '），但没有内容可以回滚。'
+    )
+  }
   return (
     '已为 ' + target.displayPath + ' 打了一份快照 #' + latest.id +
     '（' + fmtTime(latest.at) + '，' + fmtSize(latest.size) + '，标记 ' + reason + '）。\n' +
@@ -792,12 +855,33 @@ export function apply(ctx) {
     }
   }
 
+  // 这个前缀路由是挂在宿主 webServer 上的，本身不带 GUI 那套授权。回档等于写盘，
+  // 所以必须挡住跨站请求：任何网页都能用
+  //   <img src="http://127.0.0.1:3080/beforewrite/api/restore?id=3">
+  // 让本机文件被静默回滚。这是真实可触发的越权写，不是理论问题。
+  const sameOrigin = (req) => {
+    const headers = (req && req.headers) || {}
+    const site = String(headers['sec-fetch-site'] || '')
+    if (site && site !== 'same-origin' && site !== 'none') return false
+    const origin = String(headers.origin || '')
+    if (!origin) return true
+    try {
+      return new URL(origin).host === String(headers.host || '')
+    } catch {
+      return false
+    }
+  }
+
   const apiHandler = async (req, res) => {
     try {
       const url = new URL(String(req.url || '/'), 'http://127.0.0.1')
       const sub = url.pathname.replace(/^\/beforewrite\/api/, '') || '/'
+      const method = String((req && req.method) || 'GET').toUpperCase()
       if (sub === '/' || sub === '/ping') {
-        return send(res, 200, { ok: true, root: ROOT, version: 'v4' })
+        return send(res, 200, { ok: true, root: ROOT, version: 'v5' })
+      }
+      if (!sameOrigin(req)) {
+        return send(res, 403, { ok: false, text: '只接受同源请求。' })
       }
       if (sub === '/client-log') {
         // 浏览器里没法看控制台，就让客户端把话写回宿主日志：这是唯一的远端眼睛。
@@ -810,7 +894,14 @@ export function apply(ctx) {
       }
       if (sub === '/timeline') {
         const sid = url.searchParams.get('sid') || ''
-        return send(res, 200, { ok: true, sid, rows: timelineFor(sid) })
+        // 长会话几千条事件，全量返回会把浏览器拖死；只给最近一段并告知被截断。
+        const want = Number(url.searchParams.get('limit')) || TIMELINE_LIMIT
+        const limit = Math.max(1, Math.min(2000, want))
+        const all = timelineFor(sid)
+        const rows = all.length > limit ? all.slice(-limit) : all
+        return send(res, 200, {
+          ok: true, sid, rows, total: all.length, truncated: all.length > rows.length,
+        })
       }
       if (sub === '/diff') {
         const id = Number(url.searchParams.get('id'))
@@ -821,6 +912,10 @@ export function apply(ctx) {
         return send(res, 200, { ok: true, text })
       }
       if (sub === '/restore') {
+        // 会改磁盘的接口只认 POST：避免 GET 被图片标签、链接预览之类的东西顺手触发。
+        if (method !== 'POST') {
+          return send(res, 405, { ok: false, text: '回档只接受 POST。' })
+        }
         const id = Number(url.searchParams.get('id'))
         const fsService = readFs()
         if (!fsService) return send(res, 200, { ok: false, text: '文件系统服务当前不可用。' })
