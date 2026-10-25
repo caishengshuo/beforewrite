@@ -1,6 +1,6 @@
 {
   "name": "dsh-beforewrite",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "private": false,
   "type": "module",
   "description": "Every file, one version before it breaks. Snapshots a file the instant before an agent rewrites it, plus a per-session timeline in the GUI where any point can be restored with one click.",
