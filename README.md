@@ -130,12 +130,14 @@ time_machine(action="snapshot", path="G:\\proj\\config.yaml", reason="before-bas
 
 时间轴的数据不是另存一份对话，而是旁路监听宿主的 `session/event`（emit，只读，不改任何决策），落盘在你自己的 `sessions.jsonl` 里。界面取数走插件自带的 HTTP 接口：
 
-| 接口 | 作用 |
-|---|---|
-| `GET /beforewrite/api/sessions` | 会话列表 |
-| `GET /beforewrite/api/timeline?sid=…` | 某会话的时间轴 |
-| `GET /beforewrite/api/diff?id=…` | 某条快照的 diff |
-| `GET /beforewrite/api/restore?id=…` | 把文件还原到该快照 |
+| 接口 | 方法 | 作用 |
+|---|---|---|
+| `/beforewrite/api/sessions` | GET | 会话列表 |
+| `/beforewrite/api/timeline?sid=…&limit=…` | GET | 某会话的时间轴（默认最近 400 条，附 `total` / `truncated`） |
+| `/beforewrite/api/diff?id=…` | GET | 某条快照的 diff |
+| `/beforewrite/api/restore?id=…` | **POST** | 把文件还原到该快照 |
+
+> 回档是**会改磁盘**的接口，所以只认 `POST`，并且校验同源（`Sec-Fetch-Site` / `Origin` 必须与本机一致，否则 403）。否则任意一个网页都能用 `<img src="http://127.0.0.1:3080/beforewrite/api/restore?id=3">` 让你的文件被静默回滚。只读接口同样走同源校验。
 
 > 界面那半边是 `client.js`，纯 JS、无构建步骤，挂在 `shell.overlay` 槽位上。它自己往 `document.head` 插一份 `<style>`——因为宿主里 `require('styles')` 拿不到，只靠它整块面板会变成无样式的裸文字盖在对话上。
 
@@ -185,10 +187,22 @@ node smoke.mjs
 
 它验证五件事：写入前快照 → 列表读取 → diff 内容正确 → restore 精确还原 → stats 计数。改动 `index.js` 后先跑它，再谈装进运行时。
 
+## 安全与可靠性（v5.1 修的一批）
+
+| 问题 | 处理 |
+|---|---|
+| 回档接口是 GET、不校验来源，任意网页一个 `<img>` 就能回滚你的文件 | 只认 `POST` + 同源校验；跨站 403，GET 405 |
+| 二进制文件被回档会把字节当文本写回，图片直接废掉 | 存的时候按内容判定二进制并打标记；`diff` / `restore` 一律拒绝，并给出内容块路径让人工取 |
+| 回档不带版本号，期间被别的程序改过就无声覆盖 | 读 `version` 后带 `expected` 写入，冲突明确报错 |
+| `debug.log` 到 256KB 就静默停写，排查断线 | 滚动成 `debug.log.1` 继续写 |
+| 时间轴一次返回整条会话，长会话把浏览器拖死 | 默认最近 400 条，附 `total` / `truncated`，界面提示截断 |
+| 对不存在的路径打点仍报「已打了一份快照」 | 明确说明路径不存在、没有内容可回滚 |
+| 快照用同步写落 2MiB，阻塞事件循环 | 改异步写 |
+
 ## 局限（说清楚比藏着好）
 
 1. **拦不住 shell**。`rm`、`sed -i`、重定向都不经过文件服务。需要手动 `snapshot`。
-2. **只管文本**。二进制文件会被跳过或按字节存下来但无法 diff。
+2. **二进制只存不还原**。字节会被完整存下来（标记 `binary`），但回档是「把字节当文本写回」，所以对这类文件拒绝回档，只能从 `blobs/` 手工取。
 3. **没有远程同步**。仓库是本地的，换机器就没了。
 4. **不改写历史**。索引只增不减（`list` 是读时截断），所以磁盘会慢慢长。
 5. **工具名固定**为 `time_machine`，不随项目名变化——改名会动到已安装实例的工具注册，留到下一个大版本。
@@ -197,7 +211,8 @@ node smoke.mjs
 
 - **会话级回滚**：现在只能按文件退。理想是 `restore turn=<回合号>`，一次把某一轮对话里碰过的所有文件全退回去。
 - **保留策略**：现在只有条数上限。改成「7 天内全留，之后每天留一条」，仓库不会无限长。
-- **面板**：侧边栏一条时间轴，点一下回滚。唯一需要画界面的部分。
+- **索引缓存**：每次工具调用都全量读 `index.jsonl`，大仓库下该按 mtime 缓存。
+- **二进制回档**：要等 fs 服务提供按字节写回的接口，才能真还原图片。
 
 ---
 
@@ -210,6 +225,8 @@ It then exposes one tool, `time_machine`, with six actions: `list`, `history`, `
 Why it is uncommon: almost every plugin in this ecosystem mounts a Client UI slot and gives you another panel. BeforeWrite mounts a Host waterfall and changes what happens, invisibly, at the moment that matters. There is no UI to reward you for it — which is exactly why the two hardest findings (the listener registration matrix and the package-name module cache) are documented in `docs/waterfall-notes.md`.
 
 Everything the agent writes through the file service is captured automatically, one snapshot per write. Shell-level destruction (`rm`, `sed -i`, redirection) is out of reach and needs a manual `snapshot` call first.
+
+v5.1 hardening: the restore endpoint is POST-only and same-origin-checked (an `<img src=.../restore?id=3>` on any web page could otherwise roll your files back), binary files are marked and refused for restore and diff instead of being written back as text, restores carry an expected version so a concurrent external edit is reported rather than silently overwritten, and the timeline API is capped at 400 recent rows.
 
 MIT licensed.
 
