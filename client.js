@@ -125,7 +125,7 @@ window.__ModuleLoader__.load({
     function Row(props) {
       const row = props.row
       const badge = badgeOf(row)
-      const canRestore = row.kind === 'snap' && row.sha && !row.absent
+      const canRestore = row.kind === 'snap' && row.sha && !row.absent && !row.binary && !row.tooLarge
       const body = row.kind === 'snap'
         ? h('code', null, '#' + row.id + ' ' + String(row.text || ''))
         : String(row.text || '')
@@ -148,6 +148,7 @@ window.__ModuleLoader__.load({
       const [rows, setRows] = React.useState([])
       const [note, setNote] = React.useState('')
       const [busy, setBusy] = React.useState(false)
+      const [cut, setCut] = React.useState(0)
 
       // 自检：面板到底有没有真的画出来、有没有被压在对话下面。
       if (React.useEffect) {
@@ -191,6 +192,8 @@ window.__ModuleLoader__.load({
         getJson(API + '/timeline?sid=' + encodeURIComponent(sid)).then(function (data) {
           if (!alive) return
           setRows(Array.isArray(data && data.rows) ? data.rows : [])
+          const cut = data && data.truncated
+          setCut(cut ? Number(data.total || 0) - (data.rows ? data.rows.length : 0) : 0)
         }).catch(function (error) {
           if (alive) setNote('取时间轴失败：' + errText(error))
         })
@@ -201,7 +204,10 @@ window.__ModuleLoader__.load({
         if (busy) return
         setBusy(true)
         setNote('正在回档 #' + row.id + ' …')
-        getJson(API + '/restore?id=' + encodeURIComponent(row.id)).then(function (data) {
+        fetch(API + '/restore?id=' + encodeURIComponent(row.id), {
+          method: 'POST',
+          credentials: 'same-origin',
+        }).then(function (res) { return res.json() }).then(function (data) {
           setNote(String((data && data.text) || '已回档。'))
           return getJson(API + '/timeline?sid=' + encodeURIComponent(sid))
         }).then(function (again) {
@@ -254,6 +260,9 @@ window.__ModuleLoader__.load({
           h('button', { className: 'bw-x', onClick: function () { setOpen(false) }, title: '关闭' }, '×')
         ),
         note ? h('div', { className: 'bw-note' }, note) : null,
+        cut > 0
+          ? h('div', { className: 'bw-note' }, '时间轴太长，只显示最近 ' + rows.length + ' 条（更早的 ' + cut + ' 条没画出来；要回档更早的版本，直接用编号调接口或用工具）。')
+          : null,
         h('div', { className: 'bw-rows' }, body)
       )
 
