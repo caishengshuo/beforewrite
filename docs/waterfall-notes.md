@@ -166,3 +166,39 @@ CLIENT open mask=0/0/1699/982 top=bw-text
 ### 5. 悬浮按钮别抢别人的位置
 
 `shell.overlay` 是整层覆盖、子元素各自 `pointer-events:auto`。按钮放右下角会和别的插件（比如 dsh-purge）的 dock 按钮打架，实测直接盖住对方的按钮。放**右上角顶栏下方**（`right:18px; top:66px`）最安全。
+
+## 坑四：给宿主插件开 HTTP 接口，先想清楚谁在拨它
+
+`webServer.register({ kind: 'prefix', path: '/beforewrite/api', handler })` 挂出来的路由**不带 GUI 那套授权**。第一次写的时候我把回档做成了 `GET /restore?id=3`，结果就是：任何一个网页、任何一个本地程序，只要会发请求，就能让本机文件被静默回滚。
+
+```html
+<img src="http://127.0.0.1:3080/beforewrite/api/restore?id=3">
+```
+
+浏览器会老老实实替你发这个 GET。所以：
+
+- **会改磁盘的接口只认 POST**，别的动词直接 405。
+- **同源校验**：`sec-fetch-site` 必须是 `same-origin` 或 `none`；带了 `origin` 就要求它的 host 等于 `host` 头。
+- 只读接口也照加——路径本身也是信息，`/diff` 能读出别人机器上有哪些文件。
+
+```js
+const sameOrigin = (req) => {
+  const headers = req.headers || {}
+  const site = String(headers['sec-fetch-site'] || '')
+  if (site && site !== 'same-origin' && site !== 'none') return false
+  const origin = String(headers.origin || '')
+  if (!origin) return true
+  try { return new URL(origin).host === String(headers.host || '') } catch { return false }
+}
+```
+
+### 顺带：回档要带版本号
+
+`fs.writeText(target, text)` 不带 `expected` 就是无条件覆盖。用户点回档的那一秒，编辑器/另一个进程可能刚改过这个文件，于是那笔改动无声消失。正确写法是先 `stat` 拿 `version`：
+
+```js
+const info = await fs.stat(target)
+await fs.writeText(target, text, info && info.version !== undefined ? { version: info.version } : undefined)
+```
+
+版本冲突会抛错——**抛错是对的**，把「文件刚被别处改过，再点一次」告诉用户，比悄悄覆盖强。
